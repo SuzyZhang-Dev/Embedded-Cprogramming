@@ -1,120 +1,146 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
-#include "hardware/pwm.h"
 #include "hardware/gpio.h"
-#include "pico/util/queue.h"
 
-#define LED0_PIN 22
-#define LED1_PIN 21
-#define LED2_PIN 20
-#define ENCODER_A 10
-#define ENCODER_B 11
-#define ENCODER_SW 12
-#define BRIGHTNESS_MAX 1000
+#define SENSOR_PIN 28
+#define MOTOR_PINS {2,3,6,13}
+#define STEP_DELAY_MS 5
 
-//3 LEDs on/off/dim together. Need to release. Holding doesn't cause keep lighting.
-//Rot_sw is main switch. clockwise increase brightness; anti-clockwise decrease brightness.
-    //if leds are off, no effect;
-//if leds brightness have been changed, it should remain when next time toggle them.
-    //leds-ON, brightness=0, rot_sw==0, brightness to 50%.(instead of turn to off)
-//divider 125, PWM-frequency 1kHz, Top=999
-//no any application logic in ISR
-//rot_sw needs unbound
+const bool half_step_sequence[8][4]={
+    {1,0,0,0},
+    {1,1,0,0},
+    {0,1,0,0},
+    {0,1,1,0},
+    {0,0,1,0},
+    {0,0,1,1},
+    {0,0,0,1},
+    {1,0,0,1}
+};
 
-static queue_t events;
+bool is_calibrated=false;
+float step_per_revolution=4096;
 
-static void encoder_handler(uint gpio, uint32_t events_mask) {
-    if (gpio == ENCODER_A) {
-        int event_value;
-        if (gpio_get(ENCODER_B)) {
-            event_value = -1;
-        } else {
-            event_value = 1;
-        }
-        queue_try_add(&events, &event_value);
+void set_step_pins(const bool seq[4],const uint pins[4]) {
+    for(int i=0;i<4;i++) {
+        gpio_put(pins[i],seq[i]);
     }
+}
+
+void run_one_step(const uint pins[4],int direction) {
+    static int step_index = 0;
+    step_index=(step_index+direction+8)%8;
+    set_step_pins(half_step_sequence[step_index],pins);
+    sleep_ms(STEP_DELAY_MS);
+}
+
+// to find the starting point when the signal shows 1->0
+uint run_until_falling_edge(int pin,const uint pins[4],int direction) {
+    int steps_taken=0;
+    int previous_state;
+    int current_state=gpio_get(pin);
+    do {
+        previous_state=current_state;
+        run_one_step(pins,direction);
+        steps_taken++;
+        current_state=gpio_get(pin);
+    } while(!(previous_state == 1 && current_state == 0));
+
+    return steps_taken;
+}
+
+void do_calibration(const uint pins[4]) {
+    printf("Starting calibration\n");
+    uint step_count_per_revolution[3]; //count 3 laps and do average
+    float sum_steps=0;
+    int direction=1; //clock-wise
+
+    run_until_falling_edge(SENSOR_PIN,pins,direction);
+    printf("Start point found. Continuing calibration...\n");
+
+    for (int i=0;i<3;i++) {
+        printf("Starting round %d\n",i+1);
+        uint steps_this_rev=run_until_falling_edge(SENSOR_PIN,pins,direction);
+        step_count_per_revolution[i]=steps_this_rev;
+        sum_steps+=steps_this_rev;
+        printf("Round %d completed, steps: %d.\n",i+1,steps_this_rev);
+    }
+
+    step_per_revolution=sum_steps/3.0f;
+    is_calibrated = true;
+    printf("Calibrated\n");
+    printf("Steps of each round: %d,%d,%d.\n",step_count_per_revolution[0],
+        step_count_per_revolution[1],step_count_per_revolution[2]);
+    printf("Steps per round is %.2f.\n",step_per_revolution);
+}
+
+void show_status() {
+    if (is_calibrated) {
+        printf("Calibrated\n");
+        printf("Steps per round is %.2f.\n",step_per_revolution);
+    }else {
+        printf("Uncalibrated\n");
+        printf("Steps per round is not available.\n");
+    }
+}
+
+void do_run(const uint pins[4],int scanned_input,int n) {
+    if (!is_calibrated) {
+        printf("No calibration found\n");
+        return;
+    }
+    if (scanned_input == 1) n=8;
+
+    float total_steps=n/8.0f * step_per_revolution;
+
+    for (long i=0;i<total_steps;i++) {
+        run_one_step(pins,1);
+    }
+
+    set_step_pins((bool[4]){0,0,0,0},pins);
+    printf("Run %d Completed.\n",n);
+}
+
+void init_gpio(uint pins[4]) {
+    for (int i=0;i<4;i++) {
+        gpio_init(pins[i]);
+        gpio_set_dir(pins[i],GPIO_OUT);
+    }
+    gpio_init(SENSOR_PIN);
+    gpio_set_dir(SENSOR_PIN,GPIO_IN);
+    gpio_pull_up(SENSOR_PIN);
 }
 
 int main() {
     stdio_init_all();
-    gpio_init(ENCODER_A);
-    gpio_set_dir(ENCODER_A, GPIO_IN);
-    gpio_disable_pulls(ENCODER_A);
+    const uint motor_pins[4]=MOTOR_PINS;
+    init_gpio(motor_pins);
+    sleep_ms(STEP_DELAY_MS);
 
-    gpio_init(ENCODER_B);
-    gpio_set_dir(ENCODER_B, GPIO_IN);
-    gpio_disable_pulls(ENCODER_B);
+    char command_buffer[100];
+    char command[10];
+    int n_value; //read for do_run()
 
-    gpio_init(ENCODER_SW);
-    gpio_set_dir(ENCODER_SW, GPIO_IN);
-    gpio_pull_up(ENCODER_SW);
+    while (true) {
+        printf("> ");
+        if (fgets(command_buffer, sizeof(command_buffer), stdin)==NULL) {
+            continue;
+        }
+        int command_parsed_count=sscanf(command_buffer,"%s %d",command,&n_value);
+        if (command_parsed_count<=0) {
+            continue;
+        }
 
-    const uint led_pins[3] = {LED0_PIN, LED1_PIN, LED2_PIN};
-    pwm_config config = pwm_get_default_config();
-    pwm_config_set_clkdiv_int(&config, 125);
-    pwm_config_set_wrap(&config, BRIGHTNESS_MAX-1);
-
-    for (int i = 0; i < 3; i++) {
-        uint slice = pwm_gpio_to_slice_num(led_pins[i]);
-        uint channel = pwm_gpio_to_channel(led_pins[i]);
-        gpio_set_function(led_pins[i], GPIO_FUNC_PWM);
-        pwm_set_enabled(slice, false);
-        pwm_init(slice, &config, false);
-        pwm_set_chan_level(slice, channel, 0);
-        pwm_set_enabled(slice, true);
+        if (strcmp(command,"status")==0) {
+            show_status();
+        }
+        else if (strcmp(command,"calib")==0) {
+            do_calibration(motor_pins);
+        }
+        else if (strcmp(command,"run")==0) {
+            do_run(motor_pins,command_parsed_count,n_value);
+        }else {
+            printf("Invalid command!\n");
+        }
     }
-
-    //set default state of leds.
-    bool leds_on=false;
-    int brightness=500;
-    int half_brightness = BRIGHTNESS_MAX/2;
-    bool sw_released=true;
-    int last_brightness = brightness;
-
-    queue_init(&events, sizeof(int), 16);
-    gpio_set_irq_enabled_with_callback(ENCODER_A, GPIO_IRQ_EDGE_RISE, true, &encoder_handler);
-
-    while (1) {
-        bool sw_pressed=!gpio_get(ENCODER_SW);
-
-        if (sw_pressed&&sw_released) {
-            sw_released=false;
-            if (leds_on&&brightness==0) {
-                brightness=half_brightness;
-            }else {
-                leds_on=!leds_on;
-                //test whether when sw1_press works.
-                printf("LEDs toggled\n");
-            }
-        }else if (!sw_pressed){
-            sw_released=true;
-        }
-
-        int value=0;
-        int received_value;
-        while (queue_try_remove(&events, &received_value)) {
-            value += received_value;
-        }
-        // only leds are on could be dimmed.
-        if (leds_on) {
-            if (value!=0) {
-                brightness+=(value*10);
-                if (brightness>BRIGHTNESS_MAX) brightness=BRIGHTNESS_MAX;
-                if (brightness<0) brightness=0;
-            }
-        }
-
-        int current_pwm=0;
-        if (leds_on) current_pwm=brightness;
-
-        for (int i = 0; i < 3; i++) {
-            pwm_set_gpio_level(led_pins[i], current_pwm);
-        }
-        //print to serial for debugging
-        if (brightness != last_brightness) {
-            printf("Brightness: %d\n", brightness);
-            last_brightness = brightness;
-        }
-        sleep_ms(10);
-    }
-};
+}

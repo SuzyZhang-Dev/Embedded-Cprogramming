@@ -1,0 +1,19 @@
+# 永久忽略这些与 Lab 无关的文件夹，它们将永远不会被 Git 跟踪或上传。
+
+# 忽略 rpi-pico-minimal 文件夹
+/rpi-pico-minimal/
+
+# 忽略 pico-examples 文件夹
+/pico-examples/
+
+# 忽略 pico-sdk 文件夹
+/pico-sdk/
+
+# 忽略 uart_irq 文件夹
+/uart_irq/
+
+
+# 此外，你也可以在这里添加其他常见的、永远不想上传的文件，例如：
+# .DS_Store     # macOS 隐藏文件
+# *.log         # 日志文件
+# *.o           # 编译产生的对象文
